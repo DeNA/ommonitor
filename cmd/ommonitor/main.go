@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/redis/rueidis"
 	"log"
 	"os"
 	"os/signal"
@@ -11,11 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/redis/go-redis/v9"
-
 	"github.com/DeNA/ommonitor"
 	"github.com/DeNA/ommonitor/ui"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
@@ -31,6 +30,8 @@ func main() {
 	flag.StringVar(&extColsStr, "ext-cols", "", "extension keys to add table columns")
 	var refreshInterval time.Duration
 	flag.DurationVar(&refreshInterval, "refresh", 2*time.Second, "Specify the default refresh rate")
+	var isMinimatch bool
+	flag.BoolVar(&isMinimatch, "minimatch", false, "minimatch mode")
 	flag.Parse()
 	extCols := strings.Split(extColsStr, ",")
 
@@ -39,14 +40,23 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	client := redis.NewClient(&redis.Options{
-		Addr: addr,
+	client, err := rueidis.NewClient(rueidis.ClientOption{
+		InitAddress:  []string{addr},
+		DisableCache: true,
 	})
-
-	if _, err := client.Ping(ctx).Result(); err != nil {
+	if err != nil {
+		log.Fatalf("failed to create redis client: %+v", err)
+	}
+	resp := client.Do(ctx, client.B().Ping().Build())
+	if err := resp.Error(); err != nil {
 		log.Fatalf("failed to connect to Redis %s: %+v", addr, err)
 	}
-	monitor := ommonitor.NewMonitor(client)
+
+	var options []ommonitor.MonitorOption
+	if isMinimatch {
+		options = append(options, ommonitor.WithMinimatch())
+	}
+	monitor := ommonitor.NewMonitor(addr, client, options...)
 	ticketsTable := ui.NewTicketTableModel(extCols)
 	ticketDetail, err := ui.NewTicketDetailModel()
 	if err != nil {
