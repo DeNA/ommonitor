@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/redis/rueidis"
 	"log"
 	"os"
 	"os/signal"
@@ -12,9 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/redis/rueidis"
+
 	"github.com/DeNA/ommonitor"
 	"github.com/DeNA/ommonitor/ui"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
@@ -32,6 +33,8 @@ func main() {
 	flag.DurationVar(&refreshInterval, "refresh", 2*time.Second, "Specify the default refresh rate")
 	var isMinimatch bool
 	flag.BoolVar(&isMinimatch, "minimatch", false, "minimatch mode")
+	var redisKeyPrefix string
+	flag.StringVar(&redisKeyPrefix, "prefix", "", "redis key prefix (for minimatch)")
 	flag.Parse()
 	extCols := strings.Split(extColsStr, ",")
 
@@ -55,6 +58,9 @@ func main() {
 	var options []ommonitor.MonitorOption
 	if isMinimatch {
 		options = append(options, ommonitor.WithMinimatch())
+	}
+	if redisKeyPrefix != "" {
+		options = append(options, ommonitor.WithRedisKeyPrefix(redisKeyPrefix))
 	}
 	monitor := ommonitor.NewMonitor(addr, client, options...)
 	ticketsTable := ui.NewTicketTableModel(extCols)
