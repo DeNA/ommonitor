@@ -59,7 +59,7 @@ func (m TicketTableModel) Update(msg tea.Msg) (TicketTableModel, tea.Cmd) {
 
 	// handle message
 	switch msg := msg.(type) {
-	case TicketsLoadedMsg:
+	case ticketsLoadedMsg:
 		if msg.Error != nil {
 			break
 		}

@@ -5,29 +5,24 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/DeNA/ommonitor"
-	"github.com/DeNA/ommonitor/viewutils"
 )
 
 const (
-	fetchTicketsTimeout = 30 * time.Second
+	fetchTicketsTimeout = 5 * time.Minute
 )
 
-type AppStatus string
+type triggerTicketFetchMsg struct{}
 
-const (
-	AppStatusLoading AppStatus = "Loading"
-	AppStatusError   AppStatus = "Error"
-	AppStatusReady   AppStatus = "Ready"
-)
+type reportFetchProgressMsg struct {
+	ch       <-chan ommonitor.MonitorFetchProgress
+	progress ommonitor.MonitorFetchProgress
+}
 
-type TriggerTicketFetchMsg struct{}
-
-type TicketsLoadedMsg struct {
+type ticketsLoadedMsg struct {
 	Tickets []ommonitor.Ticket
 	Error   error
 }
@@ -37,10 +32,9 @@ type AppRootModel struct {
 	monitor         *ommonitor.Monitor
 	ticketsTable    TicketTableModel
 	ticketDetail    TicketDetailModel
-	status          AppStatus
-	error           error
-	spinner         spinner.Model
+	indicator       indicatorModel
 	refreshInterval time.Duration
+	progress        <-chan ommonitor.MonitorFetchProgress
 }
 
 func NewAppRootModel(ctx context.Context, monitor *ommonitor.Monitor, table TicketTableModel, detail TicketDetailModel, refreshInterval time.Duration) *AppRootModel {
@@ -49,17 +43,15 @@ func NewAppRootModel(ctx context.Context, monitor *ommonitor.Monitor, table Tick
 		monitor:         monitor,
 		ticketsTable:    table,
 		ticketDetail:    detail,
-		status:          AppStatusLoading,
-		error:           nil,
-		spinner:         spinner.New(),
+		indicator:       newIndicator(monitor.RedisAddr(), refreshInterval),
 		refreshInterval: refreshInterval,
 	}
 }
 
 func (m AppRootModel) Init() tea.Cmd {
 	return tea.Batch(func() tea.Msg {
-		return TriggerTicketFetchMsg{}
-	}, m.spinner.Tick)
+		return triggerTicketFetchMsg{}
+	}, m.indicator.Init())
 }
 
 func (m AppRootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -69,11 +61,8 @@ func (m AppRootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	)
 
 	// update model
-	switch m.status {
-	case AppStatusLoading:
-		m.spinner, cmd = m.spinner.Update(msg)
-		cmds = append(cmds, cmd)
-	}
+	m.indicator, cmd = m.indicator.Update(msg)
+	cmds = append(cmds, cmd)
 	m.ticketsTable, cmd = m.ticketsTable.Update(msg)
 	cmds = append(cmds, cmd)
 	if ticketSelected, ok := m.ticketsTable.TicketSelected(); ok {
@@ -84,24 +73,26 @@ func (m AppRootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// handle message
 	switch msg := msg.(type) {
-	case TriggerTicketFetchMsg:
-		m.status = AppStatusLoading
-		cmds = append(cmds, m.fetchTicketsCmd)
-	case TicketsLoadedMsg:
-		if msg.Error != nil {
-			m.status = AppStatusError
-			m.error = msg.Error
-		} else {
-			m.status = AppStatusReady
+	case triggerTicketFetchMsg:
+		cmd, prog := m.fetchTickets()
+		cmds = append(cmds, cmd, func() tea.Msg {
+			return reportFetchProgressMsg{ch: prog, progress: <-prog}
+		})
+	case reportFetchProgressMsg:
+		if msg.progress.State != ommonitor.MonitorFetchProgressStateDone {
+			cmds = append(cmds, func() tea.Msg {
+				return reportFetchProgressMsg{ch: msg.ch, progress: <-msg.ch}
+			})
 		}
+	case ticketsLoadedMsg:
 		// trigger fetch tickets periodically
 		cmds = append(cmds, tea.Tick(m.refreshInterval, func(t time.Time) tea.Msg {
-			return TriggerTicketFetchMsg{}
+			return triggerTicketFetchMsg{}
 		}))
 	case tea.WindowSizeMsg:
 		width := msg.Width
 		height := msg.Height
-		titleBarHeight := lipgloss.Height(m.titleBarView())
+		titleBarHeight := lipgloss.Height(m.indicator.View())
 		statusBarHeight := lipgloss.Height(m.statusBarView())
 		tableWidth := int(float64(width)*(1-ticketDetailProportion)) - ticketTableCellStyle.GetHorizontalFrameSize()
 		tableHeight := height - (titleBarHeight + statusBarHeight) - 1
@@ -120,7 +111,7 @@ func (m AppRootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m AppRootModel) View() string {
-	titleBar := titleBarStyle.Render(m.titleBarView())
+	titleBar := titleBarStyle.Render(m.indicator.View())
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top,
 		m.ticketsTable.View(),
 		m.ticketDetail.View(),
@@ -129,29 +120,18 @@ func (m AppRootModel) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, titleBar, mainView, statusBar)
 }
 
-func (m AppRootModel) titleBarView() string {
-	return fmt.Sprintf("ommonitor - %d ticket(s), redis: %s, refresh: %v    %s",
-		m.ticketsTable.TicketCount(), m.monitor.RedisAddr(), viewutils.HumanDuration(m.refreshInterval), m.indicatorView())
-}
-
-func (m AppRootModel) indicatorView() string {
-	switch m.status {
-	case AppStatusLoading:
-		return m.spinner.View() + " Loading..."
-	case AppStatusError:
-		return fmt.Sprintf("error: %+v", m.error)
-	default:
-		return ""
-	}
-}
-
 func (m AppRootModel) statusBarView() string {
-	return fmt.Sprintf("j/k: move up/down")
+	return fmt.Sprintf("j/k: move down/up")
 }
 
-func (m AppRootModel) fetchTicketsCmd() tea.Msg {
-	ctx, cancel := context.WithTimeout(m.ctx, fetchTicketsTimeout)
-	defer cancel()
-	tickets, err := m.monitor.FetchAllTickets(ctx)
-	return TicketsLoadedMsg{Tickets: tickets, Error: err}
+func (m AppRootModel) fetchTickets() (tea.Cmd, <-chan ommonitor.MonitorFetchProgress) {
+	progCh := make(chan ommonitor.MonitorFetchProgress, 1)
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(m.ctx, fetchTicketsTimeout)
+		defer cancel()
+		tickets, err := m.monitor.FetchAllTickets(ctx, func(progress ommonitor.MonitorFetchProgress) {
+			progCh <- progress
+		})
+		return ticketsLoadedMsg{Tickets: tickets, Error: err}
+	}, progCh
 }

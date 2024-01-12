@@ -2,13 +2,15 @@ package ommonitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/redis/rueidis"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/redis/rueidis"
 	"github.com/rs/xid"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"open-match.dev/open-match/pkg/pb"
@@ -20,11 +22,8 @@ const (
 	TicketStatusActive   TicketStatus = "Active"
 	TicketStatusProposed TicketStatus = "Proposed"
 	TicketStatusAssigned TicketStatus = "Assigned"
-)
-
-const (
-	allTicketsKey      = "allTickets"
-	proposedTicketsKey = "proposed_ticket_ids"
+	scanPageSize                      = 1000
+	fetchChunkSize                    = 1000
 )
 
 type Ticket struct {
@@ -68,13 +67,21 @@ func WithMinimatch() MonitorOption {
 	})
 }
 
+func WithRedisKeyPrefix(prefix string) MonitorOption {
+	return MonitorOptionFunc(func(options *monitorOptions) {
+		options.redisKeyPrefix = prefix
+	})
+}
+
 type monitorOptions struct {
-	isMinimatch bool
+	isMinimatch    bool
+	redisKeyPrefix string
 }
 
 func defaultMonitorOptions() *monitorOptions {
 	return &monitorOptions{
-		isMinimatch: false,
+		isMinimatch:    false,
+		redisKeyPrefix: "",
 	}
 }
 
@@ -91,31 +98,125 @@ func NewMonitor(redisAddr string, client rueidis.Client, opts ...MonitorOption) 
 	}
 }
 
+func (m *Monitor) TicketCount() int {
+	return len(m.ticketsCache)
+}
+
 func (m *Monitor) RedisAddr() string {
 	return m.redisAddr
 }
 
-func (m *Monitor) FetchAllTickets(ctx context.Context) ([]Ticket, error) {
-	// First, scan the entire Redis space and fetch all ticketsMap.
+func (m *Monitor) FetchAllTickets(ctx context.Context, progress func(MonitorFetchProgress)) ([]Ticket, error) {
+	// First, scan the entire Redis space and fetch all tickets.
+	var fetchTicketIDs []string
 	if !m.firstFetchDone {
-		tids, err := m.scanAllTicketOrBackfillIDs(ctx)
+		tids, err := m.scanAllTicketOrBackfillIDs(ctx, progress)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan ticketsMap: %w", err)
+			return nil, fmt.Errorf("failed to scan all ticket IDs in redis space: %w", err)
 		}
-		ticketsMap, err := m.fetchTicketsAsMap(ctx, tids)
-		if err != nil {
-			return nil, err
-		}
-		for _, ticket := range ticketsMap {
-			m.ticketsCache[ticket.TicketID] = ticket
-		}
-		m.firstFetchDone = true
+		fetchTicketIDs = tids
 	}
 
-	// From the second time on, monitor indexed ticketsMap and fetch only newly created ticketsMap.
-	resp := m.client.Do(ctx, m.client.B().Smembers().Key(allTicketsKey).Build())
+	indexedTicketsMap, err := m.getIndexedTicketIDMap(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan ticket index: %w", err)
+	}
+	if m.firstFetchDone {
+		// fetch only newly created tickets after first-scan.
+		for tid := range indexedTicketsMap {
+			if _, ok := m.ticketsCache[tid]; !ok {
+				fetchTicketIDs = append(fetchTicketIDs, tid)
+			}
+		}
+	}
+
+	fetchedTickets, err := m.fetchTicketsAsMap(ctx, fetchTicketIDs, progress)
+	if err != nil {
+		return nil, err
+	}
+	var addedTicketIDs []string
+	for _, ticket := range fetchedTickets {
+		if _, ok := m.ticketsCache[ticket.TicketID]; !ok {
+			addedTicketIDs = append(addedTicketIDs, ticket.TicketID)
+			m.ticketsCache[ticket.TicketID] = ticket
+		}
+	}
+
+	var expiredTicketIDs []string
+	// deIndexed: (Assigned or Deleted)
+	var deIndexedTicketIDs []string
+	for _, ticket := range m.ticketsCache {
+		if ticket.HasExpired(time.Now()) {
+			expiredTicketIDs = append(expiredTicketIDs, ticket.TicketID)
+		} else if _, ok := indexedTicketsMap[ticket.TicketID]; !ok {
+			deIndexedTicketIDs = append(deIndexedTicketIDs, ticket.TicketID)
+		}
+	}
+	for _, ticketID := range expiredTicketIDs {
+		delete(m.ticketsCache, ticketID)
+	}
+
+	deIndexedTickets, err := m.fetchTicketsAsMap(ctx, deIndexedTicketIDs, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, ticket := range m.ticketsCache {
+		if updated, ok := deIndexedTickets[ticket.TicketID]; ok {
+			m.ticketsCache[ticket.TicketID] = updated
+		}
+	}
+
+	proposedTicketIDs, err := m.getProposedTicketIDMap(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get proposed ticket ids: %w", err)
+	}
+
+	var tickets []Ticket
+	for _, ticket := range m.ticketsCache {
+		if _, ok := proposedTicketIDs[ticket.TicketID]; ok {
+			ticket.Status = TicketStatusProposed
+		}
+		tickets = append(tickets, *ticket)
+	}
+	sort.SliceStable(tickets, func(i, j int) bool {
+		return tickets[i].CreatedAt.UnixNano() > tickets[j].CreatedAt.UnixNano()
+	})
+	if progress != nil {
+		progress(MonitorFetchProgress{
+			State:          MonitorFetchProgressStateDone,
+			TicketsAdded:   len(addedTicketIDs),
+			TicketsExpired: len(expiredTicketIDs),
+		})
+	}
+	if !m.firstFetchDone {
+		m.firstFetchDone = true
+	}
+	return tickets, nil
+}
+
+type MonitorFetchProgressState string
+
+const (
+	MonitorFetchProgressStateScanning MonitorFetchProgressState = "scanning"
+	MonitorFetchProgressStateFetching MonitorFetchProgressState = "fetching"
+	MonitorFetchProgressStateDone     MonitorFetchProgressState = "done"
+)
+
+type MonitorFetchProgress struct {
+	State          MonitorFetchProgressState
+	TicketsScanned int
+	TicketsFetched int
+	// --- done
+	TicketsAdded   int
+	TicketsExpired int
+}
+
+// Indexed: (Active or Proposed)
+func (m *Monitor) getIndexedTicketIDMap(ctx context.Context) (map[string]struct{}, error) {
+	key := redisKeyAllTickets(m.options.redisKeyPrefix)
+	resp := m.client.Do(ctx, m.client.B().Smembers().Key(key).Build())
 	if err := resp.Error(); err != nil {
-		return nil, fmt.Errorf("failed to fetch '%s': %w", allTicketsKey, err)
+		return nil, fmt.Errorf("failed to fetch '%s': %w", key, err)
 	}
 	indexedTicketIDs, err := resp.AsStrSlice()
 	if err != nil {
@@ -129,66 +230,34 @@ func (m *Monitor) FetchAllTickets(ctx context.Context) ([]Ticket, error) {
 		}
 		indexedTicketsIDMap[tid] = struct{}{}
 	}
-	ticketsMap, err := m.fetchTicketsAsMap(ctx, fetchKeys)
-	if err != nil {
-		return nil, err
-	}
-	for _, ticket := range ticketsMap {
-		m.ticketsCache[ticket.TicketID] = ticket
-	}
+	return indexedTicketsIDMap, nil
+}
 
-	// get proposed ids
-	resp = m.client.Do(ctx, m.client.B().Zrevrange().Key(proposedTicketsKey).Start(0).Stop(-1).Build())
+func (m *Monitor) getProposedTicketIDMap(ctx context.Context) (map[string]struct{}, error) {
+	key := redisKeyProposedTickets(m.options.redisKeyPrefix)
+	resp := m.client.Do(ctx, m.client.B().Zrevrange().Key(key).Start(0).Stop(-1).Build())
 	if err := resp.Error(); err != nil {
-		return nil, fmt.Errorf("failed to fetch '%s': %w", proposedTicketsKey, err)
+		return nil, fmt.Errorf("failed to fetch '%s': %w", key, err)
 	}
 	proposedIDs, err := resp.AsStrSlice()
 	if err != nil {
+		return nil, fmt.Errorf("failed to decode proposed IDs as str slice: %w", err)
 	}
 	proposedIDMap := make(map[string]struct{}, len(proposedIDs))
 	for _, pid := range proposedIDs {
 		proposedIDMap[pid] = struct{}{}
 	}
-
-	var deIndexedTicketIDs []string
-	// check de-indexed (Assigned or Deleted) ticketsMap
-	for _, ticket := range m.ticketsCache {
-		if _, ok := indexedTicketsIDMap[ticket.TicketID]; !ok {
-			deIndexedTicketIDs = append(deIndexedTicketIDs, ticket.TicketID)
-		}
-	}
-	deIndexedTickets, err := m.fetchTicketsAsMap(ctx, deIndexedTicketIDs)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, ticketID := range deIndexedTicketIDs {
-		t, ok := deIndexedTickets[ticketID]
-		if !ok {
-			delete(m.ticketsCache, ticketID)
-			continue
-		}
-		if _, proposed := proposedIDMap[ticketID]; t.Assignment == nil && proposed {
-			t.Status = TicketStatusProposed
-		}
-		m.ticketsCache[ticketID] = t
-	}
-
-	var tickets []Ticket
-	for _, ticket := range m.ticketsCache {
-		tickets = append(tickets, *ticket)
-	}
-	sort.SliceStable(tickets, func(i, j int) bool {
-		return tickets[i].CreatedAt.UnixNano() > tickets[j].CreatedAt.UnixNano()
-	})
-	return tickets, nil
+	return proposedIDMap, nil
 }
 
-func (m *Monitor) scanAllTicketOrBackfillIDs(ctx context.Context) ([]string, error) {
+func (m *Monitor) scanAllTicketOrBackfillIDs(ctx context.Context, progress func(MonitorFetchProgress)) ([]string, error) {
 	var ticketIDs []string
 	cursor := uint64(0)
 	for {
-		resp := m.client.Do(ctx, m.client.B().Scan().Cursor(cursor).Count(10).Build())
+		resp := m.client.Do(ctx, m.client.B().Scan().
+			Cursor(cursor).
+			Match(fmt.Sprintf("%s*", m.options.redisKeyPrefix)).
+			Count(scanPageSize).Build())
 		if err := resp.Error(); err != nil {
 			return nil, err
 		}
@@ -197,9 +266,13 @@ func (m *Monitor) scanAllTicketOrBackfillIDs(ctx context.Context) ([]string, err
 			return nil, err
 		}
 		for _, key := range entry.Elements {
+			key = strings.TrimPrefix(key, m.options.redisKeyPrefix)
 			if _, err := xid.FromString(key); err == nil {
 				ticketIDs = append(ticketIDs, key)
 			}
+		}
+		if progress != nil {
+			progress(MonitorFetchProgress{State: MonitorFetchProgressStateScanning, TicketsScanned: len(ticketIDs)})
 		}
 		if entry.Cursor == 0 {
 			break
@@ -209,91 +282,153 @@ func (m *Monitor) scanAllTicketOrBackfillIDs(ctx context.Context) ([]string, err
 	return ticketIDs, nil
 }
 
-func (m *Monitor) fetchTicketsAsMap(ctx context.Context, ticketIDs []string) (map[string]*Ticket, error) {
+func (m *Monitor) fetchTicketsAsMap(ctx context.Context, ticketIDs []string, progress func(MonitorFetchProgress)) (map[string]*Ticket, error) {
 	if len(ticketIDs) == 0 {
 		return map[string]*Ticket{}, nil
 	}
 	keys := make([]string, 0, len(ticketIDs))
 	for _, ticketID := range ticketIDs {
-		keys = append(keys, redisKeyTicketData(ticketID))
+		keys = append(keys, redisKeyTicketData(m.options.redisKeyPrefix, ticketID))
 	}
-	mGet, err := rueidis.MGet(m.client, ctx, keys)
-	if err != nil {
-		return nil, err
-	}
+
 	tickets := map[string]*Ticket{}
-	for _, resp := range mGet {
-		if err := resp.Error(); err != nil {
-			if rueidis.IsRedisNil(err) {
-				// key not exists
-				continue
-			}
-			return nil, fmt.Errorf("failed to fetch Tickets: %w", err)
-		}
-		data, err := resp.AsBytes()
+	for _, chunkedKeys := range chunkBy(keys, fetchChunkSize) {
+		mGet, err := rueidis.MGet(m.client, ctx, chunkedKeys)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get ticket data as bytes: %w", err)
+			return nil, err
 		}
-		t, err := decodeTicket(data)
-		if err != nil {
-			// not Ticket but Backfill?
-			continue
-		}
-		status := TicketStatusActive
-		var expiredAt *time.Time
-		if exp, ok := m.getExpiredAt(ctx, t.Id); ok {
-			expiredAt = &exp
-		}
-		tickets[t.Id] = &Ticket{
-			TicketID:     t.Id,
-			Status:       status,
-			CreatedAt:    t.CreateTime.AsTime(),
-			SearchFields: t.SearchFields,
-			Extensions:   t.Extensions,
-			Assignment:   t.Assignment,
-			ExpiredAt:    expiredAt,
-		}
-	}
-	if m.options.isMinimatch {
-		keys := make([]string, 0, len(tickets))
-		for _, ticket := range tickets {
-			keys = append(keys, redisKeyAssignmentData(ticket.TicketID))
-		}
-		mGet, err := rueidis.MGet(m.client, ctx, keys)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch assignemnts: %w", err)
-		}
-		for key, resp := range mGet {
+		ticketCh := make(chan *Ticket, len(chunkedKeys))
+		eg, _ := errgroup.WithContext(ctx)
+		for _, resp := range mGet {
 			if err := resp.Error(); err != nil {
 				if rueidis.IsRedisNil(err) {
+					// key not exists
 					continue
 				}
-				return nil, fmt.Errorf("failed to fetch assignment: %w", err)
 			}
-			data, err := resp.AsBytes()
-			if err != nil {
-				return nil, fmt.Errorf("failed to get assignment data as bytes: %w", err)
-			}
-			as, err := decodeAssignment(data)
-			if err != nil {
-				return nil, fmt.Errorf("failed to decode assignment data: %w", err)
-			}
-			ticketID := ticketIDFromAssignmentKey(key)
-			if _, ok := tickets[ticketID]; ok {
-				tickets[ticketID].Assignment = as
+			r := resp
+			eg.Go(func() error {
+				ticket, err := m.decodeTicketResp(ctx, &r)
+				if err != nil {
+					if errors.Is(err, errNotTicket) {
+						// skip when backfill
+						return nil
+					}
+					return err
+				}
+				ticketCh <- ticket
+				return nil
+			})
+		}
+		if err := eg.Wait(); err != nil {
+			return nil, fmt.Errorf("failed to fetch Tickets: %w", err)
+		}
+		close(ticketCh)
+		var chunkedTicketIDs []string
+		for ticket := range ticketCh {
+			tickets[ticket.TicketID] = ticket
+			chunkedTicketIDs = append(chunkedTicketIDs, ticket.TicketID)
+		}
+		if m.options.isMinimatch {
+			if err := m.fetchMinimatchAssignments(ctx, chunkedTicketIDs, tickets); err != nil {
+				return nil, fmt.Errorf("failed to fetch minimatch assignments: %w", err)
 			}
 		}
-	}
-	for _, ticket := range tickets {
-		if ticket.Assignment != nil {
-			ticket.Status = TicketStatusAssigned
+		if progress != nil {
+			progress(MonitorFetchProgress{
+				State:          MonitorFetchProgressStateFetching,
+				TicketsFetched: len(tickets),
+			})
 		}
 	}
 	return tickets, nil
 }
 
+var (
+	errNotTicket = errors.New("is not ticket")
+)
+
+func (m *Monitor) decodeTicketResp(ctx context.Context, resp *rueidis.RedisMessage) (*Ticket, error) {
+	data, err := resp.AsBytes()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ticket data as bytes: %w", err)
+	}
+	t, err := decodeTicket(data)
+	if err != nil {
+		// not Ticket but Backfill?
+		return nil, errNotTicket
+	}
+	status := TicketStatusActive
+	var expiredAt *time.Time
+	if exp, ok := m.getExpiredAt(ctx, t.Id); ok {
+		expiredAt = &exp
+	}
+	return &Ticket{
+		TicketID:     t.Id,
+		Status:       status,
+		CreatedAt:    t.CreateTime.AsTime(),
+		SearchFields: t.SearchFields,
+		Extensions:   t.Extensions,
+		Assignment:   t.Assignment,
+		ExpiredAt:    expiredAt,
+	}, nil
+}
+
+func (m *Monitor) fetchMinimatchAssignments(ctx context.Context, ticketIDs []string, tickets map[string]*Ticket) error {
+	keys := make([]string, 0, len(ticketIDs))
+	for _, ticketID := range ticketIDs {
+		keys = append(keys, redisKeyAssignmentData(m.options.redisKeyPrefix, ticketID))
+	}
+	mGet, err := rueidis.MGet(m.client, ctx, keys)
+	if err != nil {
+		return fmt.Errorf("failed to fetch assignemnts: %w", err)
+	}
+
+	asCh := make(chan struct {
+		ticketID string
+		as       *pb.Assignment
+	}, len(keys))
+	eg, _ := errgroup.WithContext(ctx)
+	for key, resp := range mGet {
+		if err := resp.Error(); err != nil {
+			if rueidis.IsRedisNil(err) {
+				continue
+			}
+			return fmt.Errorf("failed to fetch assignment: %w", err)
+		}
+		r := resp
+		eg.Go(func() error {
+			data, err := r.AsBytes()
+			if err != nil {
+				return fmt.Errorf("failed to get assignment data as bytes: %w", err)
+			}
+			as, err := decodeAssignment(data)
+			if err != nil {
+				return fmt.Errorf("failed to decode assignment data: %w", err)
+			}
+			ticketID := ticketIDFromAssignmentKey(m.options.redisKeyPrefix, key)
+			asCh <- struct {
+				ticketID string
+				as       *pb.Assignment
+			}{ticketID: ticketID, as: as}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return err
+	}
+	close(asCh)
+	for v := range asCh {
+		if _, ok := tickets[v.ticketID]; ok {
+			tickets[v.ticketID].Assignment = v.as
+			tickets[v.ticketID].Status = TicketStatusAssigned
+		}
+	}
+	return nil
+}
+
 func (m *Monitor) getExpiredAt(ctx context.Context, ticketID string) (time.Time, bool) {
-	key := redisKeyTicketData(ticketID)
+	key := redisKeyTicketData(m.options.redisKeyPrefix, ticketID)
 	resp := m.client.Do(ctx, m.client.B().Ttl().Key(key).Build())
 	if err := resp.Error(); err != nil {
 		return time.Time{}, false
@@ -321,17 +456,34 @@ func decodeAssignment(data []byte) (*pb.Assignment, error) {
 	return &as, nil
 }
 
-func redisKeyTicketData(ticketID string) string {
-	return ticketID
+func redisKeyAllTickets(prefix string) string {
+	return fmt.Sprintf("%sallTickets", prefix)
 }
 
-func redisKeyAssignmentData(ticketID string) string {
-	return fmt.Sprintf("assign:%s", ticketID)
+func redisKeyProposedTickets(prefix string) string {
+	return fmt.Sprintf("%sproposed_ticket_ids", prefix)
 }
 
-func ticketIDFromAssignmentKey(key string) string {
+func redisKeyTicketData(prefix, ticketID string) string {
+	return fmt.Sprintf("%s%s", prefix, ticketID)
+}
+
+func redisKeyAssignmentData(prefix, ticketID string) string {
+	return fmt.Sprintf("%sassign:%s", prefix, ticketID)
+}
+
+func ticketIDFromAssignmentKey(prefix, key string) string {
+	key = strings.TrimPrefix(key, prefix)
 	if cut, ok := strings.CutPrefix(key, "assign:"); ok {
 		return cut
 	}
 	return key
+}
+
+// https://stackoverflow.com/a/72408490
+func chunkBy[T any](items []T, chunkSize int) (chunks [][]T) {
+	for chunkSize < len(items) {
+		items, chunks = items[chunkSize:], append(chunks, items[0:chunkSize:chunkSize])
+	}
+	return append(chunks, items)
 }
